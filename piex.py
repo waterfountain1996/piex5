@@ -3,7 +3,12 @@
 import asyncio
 import enum
 from ipaddress import IPv4Address, IPv6Address, ip_address
+import logging
 import struct
+
+
+VERSION = 5
+NO_METHOD = b"\x05\xFF"
 
 
 class AddressType(enum.Enum):
@@ -13,22 +18,18 @@ class AddressType(enum.Enum):
     IP6 = 4
 
 
+class AuthMethod(enum.Enum):
+    """SOCKS5 connection method."""
+    NO_AUTH = 0
+    GSSAPI = 1
+    PASSWORD = 2
+
+
 class Command(enum.Enum):
     """SOCKS5 request command."""
     CONNECT = 1
     BIND = 2
     UPD_ASSOCIATE = 3
-
-
-class Method(enum.Enum):
-    """SOCKS5 connection method."""
-    NO_AUTH = 0
-    GSSAPI = 1
-    PASSWORD = 2
-    IANA = 3
-    RESERVED = 4
-    PRIVATE = 5
-    NO_METHODS = 6
 
 
 class Reply(enum.Enum):
@@ -55,40 +56,13 @@ def get_address(address: int | str) -> IPv4Address | IPv6Address | str:
     return address if isinstance(address, str) else ip_address(address)
 
 
-def get_method_as_enum(method: int) -> Method:
-    """Get method as an enum."""
-    match method:
-        case 0 | 1 | 2:
-            return Method(method)
-        case 255:
-            return Method.NO_METHODS
-        case _:
-            if method in range(3, int('7F', 16) + 1):
-                return Method.IANA
-            elif method in range(int('80', 16), 255):
-                return Method.PRIVATE
-            else:
-                raise ValueError("Unknown method")
-
-
-def get_methods_from_message(message: bytes) -> list[Method]:
-    """Parse method selection message.
-
-    Args:
-        message: Raw message.
-
-    Returns:
-        List of client-proposed auth methods.
-    """
-    _, nmethods = struct.unpack_from("!2B", message)
-    methods = struct.unpack_from(f"!{nmethods}B", message, 2)
-    return list(get_method_as_enum(m) for m in sorted(set(methods)))
+method_message = lambda method: struct.pack("!2B", VERSION, method.value)
 
 
 class BaseSocksMessage:
     """Base class for SOCKS5 requests/messages"""
 
-    version = 5
+    version = VERSION
 
 
 class SocksRequest(BaseSocksMessage):
@@ -130,60 +104,115 @@ class SocksReply(BaseSocksMessage):
         self.bnd_port = bnd_port
 
 
+class IncorrectPacket(Exception):
+    """Incorrect packet exception.
+
+    Used when received packet or request is corrupted and can not be
+        parsed.
+    """
+
+
+def get_methods_from_message(message: bytes) -> set[AuthMethod]:
+    """Get a set of `AuthMethod` from method selection message.
+
+    Raises:
+        IncorrectPacket: If the packet is too short or corrupted.
+    """
+    if len(message) < 3:
+        raise IncorrectPacket
+
+    version, nmethods = struct.unpack_from("!2B", message)
+    if version != VERSION or nmethods != len(message) - 2:
+        raise IncorrectPacket
+
+    return set(
+        AuthMethod(m) for m in struct.unpack_from(f"!{nmethods}B", message, 2)
+        if m in range(3))
+
+
 class SocksProtocol(asyncio.Protocol):
-    """SOCKS5 protocol handler."""
+    """Proxy protocol class.
 
-    # Server authentication method.
-    auth_method = Method.NO_AUTH
+    This protocol is used to handle initial authentication and
+        connection negotiation, as well as request processing.
+    """
 
-    def __init__(self):
-        """Constructor.
-        
-        Sets up state for the client.
-        """
-        self.ignore = False
-        self.negotiating = False
+    def __init__(self, auth_method: AuthMethod = AuthMethod.NO_AUTH):
+        self.auth_method = auth_method
+        # TODO: Write a proper state machine.
+        self.state = 0
 
     def connection_made(self, transport: asyncio.Transport):
-        """Connection callback.
-
-        Starts auth negotiation mode.
-        """
         self.transport = transport
-        self.negotiating = True
+        self.peer = transport.get_extra_info("peername") # Client address.
+        self.logger = logging.getLogger()
+        self._log_connected()
+
+    def connection_lost(self, error: Exception | None):
+        self._log_disconnected()
+
+        if error is not None:
+            self.logger.exception(error)
 
     def data_received(self, data: bytes):
-        """SOCKS5 message handler."""
-        if self.ignore:
-            # Ignore packets from the client.
-            return
+        self._log_data(data)
 
-        if self.negotiating:
-            # Process method selection message.
-            methods = get_methods_from_message(data)
-            if self.auth_method not in methods:
-                # We can not authenticate with any of client's methods,
-                # so we end the negotiation and ignore further packets.
-                self.transport.write(b"\x05\xff")
-                self.negotiating = False
-                self.ignore = True
-                return
+        if self.state == 0:
+            self.handle_auth(data)
 
-            # Write selection message and stop method negotiation.
-            self.transport.write(struct.pack("!2B", 5, self.auth_method.value))
-            self.negotiating = False
-            return
+    def handle_auth(self, message: bytes):
+        try:
+            methods = get_methods_from_message(message)
+        except IncorrectPacket:
+            # Close the connection if packet was corrupted.
+            return self.transport.close()
 
-        return data
+        if self.auth_method not in methods:
+            self.logger.info(
+                f"Auth negotiation failed for {self.peer[0]}:{self.peer[1]}. "
+                "Closing connection.")
+            self.transport.write(NO_METHOD)
+            return self.transport.close()
 
+        self.logger.info(
+            f"Authenticated {self.peer[0]}:{self.peer[1]} "
+            f"with {self.auth_method.name}")
+        self.transport.write(method_message(self.auth_method))
+        self.state = 1
+
+    def _log_data(self, data):
+        """Log received data. Debug only."""
+        self.logger.debug(
+            f"Got {len(data)} bytes: "
+            f"{data if len(data) < 32 else data[:32] + b'...'}")
+
+    def _log_connected(self):
+        """Log client connection message."""
+        self.logger.info(f"{self.peer[0]}:{self.peer[1]} connected")
+
+    def _log_disconnected(self):
+        """Log client disconnect message."""
+        self.logger.info(f"{self.peer[0]}:{self.peer[1]} disconnected")
+ 
         
 async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s -- %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+
     loop = asyncio.get_running_loop()
     server = await loop.create_server(SocksProtocol, "0.0.0.0", 1080)
 
+    logging.info("Starting the server...")
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logging.getLogger().info("Stopping the server")
