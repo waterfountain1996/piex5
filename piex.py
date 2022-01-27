@@ -2,9 +2,10 @@
 
 import asyncio
 import enum
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import IPv4Address, ip_address
 import logging
 import struct
+import socket
 
 
 VERSION = 5
@@ -46,17 +47,26 @@ class Reply(enum.Enum):
     UNASSIGNED = 9
 
 
-def get_address(address: int | str) -> IPv4Address | IPv6Address | str:
-    """Get address as a corresponding type.
+method_message = lambda method: struct.pack("!2B", VERSION, method.value)
+
+
+async def resolve_addr(host: str) -> str | None:
+    """Resolve IP address from domain name.
 
     Args:
-        address: `str` for domain name address, int for IPv4/6 type
-            addresses.
+        host: Domain name.
+
+    Returns:
+        IP address string if found, otherwise None.
     """
-    return address if isinstance(address, str) else ip_address(address)
+    loop = asyncio.get_running_loop()
+    try:
+        info = await loop.getaddrinfo(host, None, proto=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None
 
+    return info[0][-1][0]
 
-method_message = lambda method: struct.pack("!2B", VERSION, method.value)
 
 
 class BaseSocksMessage:
@@ -69,7 +79,7 @@ class SocksRequest(BaseSocksMessage):
     """SOCKS5 request class."""
     
     def __init__(self, cmd: int, atyp: int,
-                 dst_addr: str | int, dst_port: int):
+                 dst_addr: str, dst_port: int):
         """Constructor.
 
         Args:
@@ -81,7 +91,7 @@ class SocksRequest(BaseSocksMessage):
         """
         self.cmd = Command(cmd)
         self.atyp = AddressType(atyp)
-        self.dst_addr = get_address(dst_addr)
+        self.dst_addr = dst_addr
         self.dst_port = dst_port
 
 
@@ -89,7 +99,7 @@ class SocksReply(BaseSocksMessage):
     """SOCKS5 reply class."""
 
     def __init__(self, reply: int, atyp: int,
-                 bnd_addr: str | int, bnd_port: int):
+                 bnd_addr: str, bnd_port: int):
         """Constructor.
         
         Args:
@@ -100,7 +110,7 @@ class SocksReply(BaseSocksMessage):
         """
         self.reply = Reply(reply)
         self.atyp = AddressType(atyp)
-        self.bnd_addr = get_address(bnd_addr)
+        self.bnd_addr = bnd_addr
         self.bnd_port = bnd_port
 
 
@@ -130,6 +140,58 @@ def get_methods_from_message(message: bytes) -> set[AuthMethod]:
         if m in range(3))
 
 
+# Minimum request length with domain name of 1 character.
+MIN_REQUEST_LENGTH = 4 + 2 + 2
+# Maximum request length with the domain name of 255 characters.
+MAX_REQUEST_LENGTH = 4 + 256 + 2
+
+
+def parse_request(buffer: bytes) -> SocksRequest:
+    """Parse buffer as a SOCKS5 request."""
+    if len(buffer) not in range(MIN_REQUEST_LENGTH, MAX_REQUEST_LENGTH + 1):
+        raise IncorrectPacket()
+
+    # First we unpack 4 starting bytes from the request.
+    version, cmd, rsv, atyp = struct.unpack_from("!4B", buffer)
+
+    # Now check the correctness of all the values.
+    if (version != VERSION
+        or cmd not in (1, 2, 3)
+        or rsv != 0
+        or atyp not in (1, 3, 4)):
+        raise IncorrectPacket()
+
+    if atyp in (AddressType.IP4.value, AddressType.IP6):
+        # AddressType value is 1 for IPv4 address and 4 for IPv6 one.
+        # The length of an IPv6Address is 4 bytes, whereas IPv6 is 16.
+        # Therefore we can just multiply `atyp` by 4 to get the length
+        # of the address, and the last two bytes are the port number.
+        try:
+            host = str(ip_address(buffer[4:4 + 4 * atyp]))
+            port = struct.unpack_from("!H", buffer, 4 + 4 * atyp)[0]
+        except (ValueError, struct.error):
+            raise IncorrectPacket()
+    else:
+        # Get the domain name length.
+        length = struct.unpack_from("!B", buffer, 4)[0]
+        # Unpack variable length name and port from the buffer.
+        try:
+            host, port = struct.unpack_from(f"!{length}sH", buffer, 5)
+            host = host.decode("ascii")
+        except (UnicodeDecodeError, struct.error):
+            raise IncorrectPacket()
+
+    return SocksRequest(cmd, atyp, host, port)
+
+
+class ClientProtocol(asyncio.Protocol):
+    def __init__(self, client: asyncio.Transport):
+        self.client = client
+
+    def data_received(self, data: bytes):
+        self.client.write(data)
+
+
 class SocksProtocol(asyncio.Protocol):
     """Proxy protocol class.
 
@@ -137,28 +199,102 @@ class SocksProtocol(asyncio.Protocol):
         connection negotiation, as well as request processing.
     """
 
+    remote: asyncio.Transport
+
     def __init__(self, auth_method: AuthMethod = AuthMethod.NO_AUTH):
+        """Constructor.
+
+        Args:
+            auth_method: SOCKS5 authentication method. No auth by
+                default.
+        """
         self.auth_method = auth_method
         # TODO: Write a proper state machine.
         self.state = 0
 
     def connection_made(self, transport: asyncio.Transport):
+        """Client connection handler."""
         self.transport = transport
         self.peer = transport.get_extra_info("peername") # Client address.
         self.logger = logging.getLogger()
         self._log_connected()
 
     def connection_lost(self, error: Exception | None):
+        """Client disconnect handler."""
         self._log_disconnected()
 
         if error is not None:
             self.logger.exception(error)
 
     def data_received(self, data: bytes):
+        """Data received callback."""
         self._log_data(data)
 
         if self.state == 0:
-            self.handle_auth(data)
+            return self.handle_auth(data)
+
+        if self.state == 1:
+            return self.on_request(data)
+
+        if self.state == 2:
+            assert self.remote is not None
+            self.remote.write(data)
+
+    def on_request(self, buffer: bytes):
+        try:
+            request = parse_request(buffer)
+        except IncorrectPacket:
+            return self.transport.close()
+
+        self.logger.info(
+            f"{self.peer[0]}:{self.peer[1]} {request.cmd.name} -> "
+            f"{request.dst_addr}:{request.dst_port}")
+
+        handler = getattr(self, f"on_{request.cmd.name.lower()}")
+        handler(request)
+
+    def on_connect(self, request: SocksRequest):
+        task = asyncio.ensure_future(self._connect_to(
+            request.dst_addr,
+            request.dst_port))
+
+        def on_socket_connect(task: asyncio.Task):
+            self.remote = task.result()
+            host, port, *_ = self.remote.get_extra_info("sockname")
+            # TODO: Refactor.
+            reply = struct.pack("!4B", VERSION, 0, 0, AddressType.IP4.value)
+            reply += ip_address(host).packed + struct.pack("!H", port)
+            self.transport.write(reply)
+            self.state = 2
+
+        task.add_done_callback(on_socket_connect)
+
+    async def _connect_to(self, host: str, port: int):
+        """Connect to remote host.
+
+        Args:
+            host: Destination IP address or a domain name.
+            port: Destination port.
+
+        Raises:
+            ValueError: if host could not be resolved.
+        """
+        addr = await resolve_addr(host)
+        if addr is None:
+            raise ValueError("Unknown destination")
+
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.create_connection(
+            lambda: ClientProtocol(client=self.transport),
+            host,
+            port)
+        return transport
+
+    def on_bind(self, _: SocksRequest):
+        raise NotImplementedError
+
+    def on_upd_associate(self, _: SocksRequest):
+        raise NotImplementedError
 
     def handle_auth(self, message: bytes):
         try:
