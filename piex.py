@@ -2,7 +2,7 @@
 
 import asyncio
 import enum
-from ipaddress import IPv4Address, ip_address
+from ipaddress import ip_address
 import logging
 import struct
 import socket
@@ -68,7 +68,6 @@ async def resolve_addr(host: str) -> str | None:
     return info[0][-1][0]
 
 
-
 class BaseSocksMessage:
     """Base class for SOCKS5 requests/messages"""
 
@@ -112,6 +111,21 @@ class SocksReply(BaseSocksMessage):
         self.atyp = AddressType(atyp)
         self.bnd_addr = bnd_addr
         self.bnd_port = bnd_port
+
+    def dump(self) -> bytes:
+        """Dump reply object as a bytes sequence."""
+        buffer = struct.pack("!4B", VERSION, self.reply.value,
+                             0, self.atyp.value)
+
+        if self.atyp in (AddressType.IP4, AddressType.IP6):
+            return (buffer
+                    + ip_address(self.bnd_addr).packed
+                    + struct.pack("!H", self.bnd_port))
+
+        return buffer + struct.pack(
+            f"!{len(self.bnd_addr)}sH",
+            self.bnd_addr.encode("ascii"),
+            self.bnd_port)
 
 
 class IncorrectPacket(Exception):
@@ -254,20 +268,24 @@ class SocksProtocol(asyncio.Protocol):
         handler(request)
 
     def on_connect(self, request: SocksRequest):
+        """CONNECT request handler."""
         task = asyncio.ensure_future(self._connect_to(
             request.dst_addr,
             request.dst_port))
 
-        def on_socket_connect(task: asyncio.Task):
+        @task.add_done_callback
+        def _(task: asyncio.Task):
+            # TODO: Handle possible exception on task result.
             self.remote = task.result()
-            host, port, *_ = self.remote.get_extra_info("sockname")
-            # TODO: Refactor.
-            reply = struct.pack("!4B", VERSION, 0, 0, AddressType.IP4.value)
-            reply += ip_address(host).packed + struct.pack("!H", port)
-            self.transport.write(reply)
+            sock = self.remote.get_extra_info("socket")
+            host, port, *_ = sock.getsockname()
+            reply = SocksReply(
+                reply=Reply.SUCCEEDED.value,
+                atyp=1 if sock.family == socket.AF_INET else 4,
+                bnd_addr=host,
+                bnd_port=port)
+            self.transport.write(reply.dump())
             self.state = 2
-
-        task.add_done_callback(on_socket_connect)
 
     async def _connect_to(self, host: str, port: int):
         """Connect to remote host.
