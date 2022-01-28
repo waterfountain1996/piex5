@@ -9,7 +9,6 @@ import socket
 
 
 VERSION = 5
-NO_METHOD = b"\x05\xFF"
 
 
 class AddressType(enum.Enum):
@@ -20,10 +19,11 @@ class AddressType(enum.Enum):
 
 
 class AuthMethod(enum.Enum):
-    """SOCKS5 connection method."""
+    """SOCKS5 authentication method."""
     NO_AUTH = 0
     GSSAPI = 1
     PASSWORD = 2
+    INVALID = 255
 
 
 class Command(enum.Enum):
@@ -33,9 +33,8 @@ class Command(enum.Enum):
     UPD_ASSOCIATE = 3
 
 
-class Reply(enum.Enum):
+class Error(enum.Enum):
     """SOCKS5 reply status code."""
-    SUCCEEDED = 0
     FAILURE = 1
     NOT_ALLOWED = 2
     NETWORK_UNREACHABLE = 3
@@ -45,9 +44,6 @@ class Reply(enum.Enum):
     NOT_SUPPORTED = 7
     ADDRESS_NOT_SUPPORTED = 8
     UNASSIGNED = 9
-
-
-method_message = lambda method: struct.pack("!2B", VERSION, method.value)
 
 
 async def resolve_addr(host: str) -> str | None:
@@ -66,6 +62,30 @@ async def resolve_addr(host: str) -> str | None:
         return None
 
     return info[0][-1][0]
+
+
+def send_error(transport: asyncio.WriteTransport, error: Error):
+    """Send a reply indicating that the request has failed.
+
+    Args:
+        transport: Writeable transport to send reply to.
+        error: Failed reply status code.
+    """
+    # As this is an error reply and we will be closing the connection
+    # after it anyway, we just use all zeros for address and port.
+    buffer = struct.pack("!4BIH", VERSION, error.value, 0, 1, 0, 0)
+    transport.write(buffer)
+
+
+def send_auth_message(transport: asyncio.WriteTransport, method: AuthMethod):
+    """Send method selection message to the client.
+
+    Args:
+        transport: Writeable transport to send message to.
+        method: Chosen authentication method.
+    """
+    buffer = struct.pack("!2B", VERSION, method.value)
+    transport.write(buffer)
 
 
 class BaseSocksMessage:
@@ -97,8 +117,7 @@ class SocksRequest(BaseSocksMessage):
 class SocksReply(BaseSocksMessage):
     """SOCKS5 reply class."""
 
-    def __init__(self, reply: int, atyp: int,
-                 bnd_addr: str, bnd_port: int):
+    def __init__(self, atyp: int, bnd_addr: str, bnd_port: int):
         """Constructor.
         
         Args:
@@ -107,14 +126,13 @@ class SocksReply(BaseSocksMessage):
             bnd_addr: Server bound address.
             bnd_port: Server bound port.
         """
-        self.reply = Reply(reply)
         self.atyp = AddressType(atyp)
         self.bnd_addr = bnd_addr
         self.bnd_port = bnd_port
 
     def dump(self) -> bytes:
         """Dump reply object as a bytes sequence."""
-        buffer = struct.pack("!4B", VERSION, self.reply.value,
+        buffer = struct.pack("!4B", VERSION, 0,
                              0, self.atyp.value)
 
         if self.atyp in (AddressType.IP4, AddressType.IP6):
@@ -198,11 +216,24 @@ def parse_request(buffer: bytes) -> SocksRequest:
     return SocksRequest(cmd, atyp, host, port)
 
 
-class ClientProtocol(asyncio.Protocol):
-    def __init__(self, client: asyncio.Transport):
+class ConnectionProtocol(asyncio.Protocol):
+    """Connection protocol class.
+
+    This protocol is used when client sends a CONNECT request to send
+        all received data from remote host back to the client.
+    """
+
+    def __init__(self, client: asyncio.WriteTransport):
+        """Constructor.
+
+        Args:
+            client: A transport through which the client will receive
+                data.
+        """
         self.client = client
 
     def data_received(self, data: bytes):
+        """Write data back to the client."""
         self.client.write(data)
 
 
@@ -223,14 +254,14 @@ class SocksProtocol(asyncio.Protocol):
                 default.
         """
         self.auth_method = auth_method
+        self.logger = logging.getLogger()
         # TODO: Write a proper state machine.
         self.state = 0
 
     def connection_made(self, transport: asyncio.Transport):
         """Client connection handler."""
         self.transport = transport
-        self.peer = transport.get_extra_info("peername") # Client address.
-        self.logger = logging.getLogger()
+        self.peer = self.transport.get_extra_info("peername")
         self._log_connected()
 
     def connection_lost(self, error: Exception | None):
@@ -255,17 +286,23 @@ class SocksProtocol(asyncio.Protocol):
             self.remote.write(data)
 
     def on_request(self, buffer: bytes):
+        """SOCKS5 request handler.
+
+        If the packet is correct, a corresponding handler is called
+            based on the request command, otherwise, an error reply
+            is sent to the client and the connection is closed.
+
+        Args:
+            buffer: Raw data from the client.
+        """
         try:
             request = parse_request(buffer)
         except IncorrectPacket:
+            send_error(self.transport, Error.FAILURE)
             return self.transport.close()
 
-        self.logger.info(
-            f"{self.peer[0]}:{self.peer[1]} {request.cmd.name} -> "
-            f"{request.dst_addr}:{request.dst_port}")
-
-        handler = getattr(self, f"on_{request.cmd.name.lower()}")
-        handler(request)
+        self._log_request(request)
+        self.__getattribute__(f"on_{request.cmd.name.lower()}")(request)
 
     def on_connect(self, request: SocksRequest):
         """CONNECT request handler."""
@@ -280,7 +317,6 @@ class SocksProtocol(asyncio.Protocol):
             sock = self.remote.get_extra_info("socket")
             host, port, *_ = sock.getsockname()
             reply = SocksReply(
-                reply=Reply.SUCCEEDED.value,
                 atyp=1 if sock.family == socket.AF_INET else 4,
                 bnd_addr=host,
                 bnd_port=port)
@@ -303,7 +339,7 @@ class SocksProtocol(asyncio.Protocol):
 
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_connection(
-            lambda: ClientProtocol(client=self.transport),
+            lambda: ConnectionProtocol(client=self.transport),
             host,
             port)
         return transport
@@ -315,23 +351,23 @@ class SocksProtocol(asyncio.Protocol):
         raise NotImplementedError
 
     def handle_auth(self, message: bytes):
+        """Handle authentication negotiation.
+
+        Sends method selection message with the chosen methods and
+            closes the connection if we can not agree on any of the
+            methods.
+        """
         try:
             methods = get_methods_from_message(message)
         except IncorrectPacket:
-            # Close the connection if packet was corrupted.
             return self.transport.close()
 
         if self.auth_method not in methods:
-            self.logger.info(
-                f"Auth negotiation failed for {self.peer[0]}:{self.peer[1]}. "
-                "Closing connection.")
-            self.transport.write(NO_METHOD)
+            send_auth_message(self.transport, AuthMethod.INVALID)
             return self.transport.close()
 
-        self.logger.info(
-            f"Authenticated {self.peer[0]}:{self.peer[1]} "
-            f"with {self.auth_method.name}")
-        self.transport.write(method_message(self.auth_method))
+        send_auth_message(self.transport, self.auth_method)
+        self._log_authed()
         self.state = 1
 
     def _log_data(self, data):
@@ -339,6 +375,18 @@ class SocksProtocol(asyncio.Protocol):
         self.logger.debug(
             f"Got {len(data)} bytes: "
             f"{data if len(data) < 32 else data[:32] + b'...'}")
+
+    def _log_request(self, request: SocksRequest):
+        """Log incoming request."""
+        self.logger.info(
+            f"{self.peer[0]}:{self.peer[1]} {request.cmd.name} -> "
+            f"{request.dst_addr}:{request.dst_port}")
+
+    def _log_authed(self):
+        """Log client authentication message."""
+        self.logger.info(
+            f"Authenticated {self.peer[0]}:{self.peer[1]} "
+            f"with {self.auth_method.name}")
 
     def _log_connected(self):
         """Log client connection message."""
