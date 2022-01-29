@@ -148,11 +148,64 @@ class SocksReply(BaseSocksMessage):
             self.bnd_port)
 
 
+class UDPHeader:
+    """UDP datagram header class."""
+
+    def __init__(self, frag: int, atyp: int, dst_addr: str, dst_port: int):
+        """Constructor.
+
+        Args:
+            frag: Fragment number.
+            atyp: Address type.
+            dst_addr: Desired destination address.
+            dst_port: Desired destination port.
+        """
+        self.frag = frag
+        self.atyp = AddressType(atyp)
+        self.dst_addr = dst_addr
+        self.dst_port = dst_port
+
+    def __len__(self):
+        # 2 bytes reserved
+        # + 1 byte fragment
+        # + 1 byte address type
+        # + 2 bytes port number
+        length = 2 + 1 + 1 + 2
+        if self.atyp == AddressType.IP4:
+            return length + 4
+
+        if self.atyp == AddressType.IP6:
+            return length + 16
+
+        return length + 1 + len(self.dst_addr)
+    
+    def dump(self) -> bytes:
+        """Dump UDP header as bytes."""
+        buffer = struct.pack("!H2B", 0, self.frag, self.atyp.value)
+
+        if self.atyp in (AddressType.IP4, AddressType.IP6):
+            return (buffer
+                    + ip_address(self.dst_addr).packed
+                    + struct.pack("!H", self.dst_port))
+
+        return buffer + struct.pack(
+            f"!{len(self.dst_addr)}sH",
+            self.dst_addr.encode("ascii"),
+            self.dst_port)
+
+
 class IncorrectPacket(Exception):
     """Incorrect packet exception.
 
     Used when received packet or request is corrupted and can not be
         parsed.
+    """
+
+
+class IncorrectUDPHeader(IncorrectPacket):
+    """Incorrect datagram header exception.
+
+    Used when received datagram contains a corrupt header.
     """
 
 
@@ -180,6 +233,40 @@ MIN_REQUEST_LENGTH = 4 + 2 + 2
 MAX_REQUEST_LENGTH = 4 + 256 + 2
 
 
+def _unpack_address_from_buffer(atyp: AddressType,
+                                buffer: bytes) -> tuple[str, int]:
+    """Unpack address and port from buffer based on AddressType.
+
+    Args:
+        atyp: Address type.
+        buffer: Buffer to extract address from.
+
+    Raises:
+        IncorrectPacket: If address is invalid.
+    """
+    if atyp in (AddressType.IP4, AddressType.IP6):
+        # AddressType value is 1 for IPv4 address and 4 for IPv6 one.
+        # The length of an IPv6Address is 4 bytes, whereas IPv6 is 16.
+        # Therefore we can just multiply `atyp` by 4 to get the length
+        # of the address, and the last two bytes are the port number.
+        try:
+            host = str(ip_address(buffer[4 * atyp.value]))
+            port = struct.unpack_from("!H", buffer, 4 * atyp.value)[0]
+        except (ValueError, struct.error):
+            raise IncorrectPacket()
+    else:
+        # Get the domain name length.
+        length = struct.unpack_from("!B", buffer)[0]
+        # Unpack variable length name and port from the buffer.
+        try:
+            host, port = struct.unpack_from(f"!{length}sH", buffer, 1)
+            host = host.decode("ascii")
+        except (UnicodeDecodeError, struct.error):
+            raise IncorrectPacket()
+
+    return host, port
+
+
 def parse_request(buffer: bytes) -> SocksRequest:
     """Parse buffer as a SOCKS5 request."""
     if len(buffer) not in range(MIN_REQUEST_LENGTH, MAX_REQUEST_LENGTH + 1):
@@ -195,27 +282,27 @@ def parse_request(buffer: bytes) -> SocksRequest:
         or atyp not in (1, 3, 4)):
         raise IncorrectPacket()
 
-    if atyp in (AddressType.IP4.value, AddressType.IP6):
-        # AddressType value is 1 for IPv4 address and 4 for IPv6 one.
-        # The length of an IPv6Address is 4 bytes, whereas IPv6 is 16.
-        # Therefore we can just multiply `atyp` by 4 to get the length
-        # of the address, and the last two bytes are the port number.
-        try:
-            host = str(ip_address(buffer[4:4 + 4 * atyp]))
-            port = struct.unpack_from("!H", buffer, 4 + 4 * atyp)[0]
-        except (ValueError, struct.error):
-            raise IncorrectPacket()
-    else:
-        # Get the domain name length.
-        length = struct.unpack_from("!B", buffer, 4)[0]
-        # Unpack variable length name and port from the buffer.
-        try:
-            host, port = struct.unpack_from(f"!{length}sH", buffer, 5)
-            host = host.decode("ascii")
-        except (UnicodeDecodeError, struct.error):
-            raise IncorrectPacket()
+    host, port = _unpack_address_from_buffer(AddressType(atyp), buffer[4:])
 
     return SocksRequest(cmd, atyp, host, port)
+
+
+def parse_udp_header(buffer: bytes) -> UDPHeader:
+    """Parse udp header from buffer."""
+    try:
+        rsv, frag, atyp = struct.unpack_from("!H2B", buffer)
+    except struct.error:
+        raise IncorrectUDPHeader()
+    else:
+        if rsv != 0 or atyp not in (1, 3, 4):
+            raise IncorrectUDPHeader()
+
+    try:
+        host, port = _unpack_address_from_buffer(AddressType(atyp), buffer[4:])
+    except IncorrectPacket:
+        raise IncorrectUDPHeader()
+
+    return UDPHeader(frag, atyp, host, port)
 
 
 class ConnectionProtocol(asyncio.Protocol):
@@ -239,6 +326,62 @@ class ConnectionProtocol(asyncio.Protocol):
         self.client.write(data)
 
 
+class UDPRelayProtocol(asyncio.DatagramProtocol):
+    """UDP relay protocol class.
+
+    This protocol is used with a datagram endpoint when the client
+        makes an UDP ASSOCIATE request. It does (de)encapsulation
+        of datagrams and relays them.
+    """
+
+    def __init__(self, client_addr: tuple[str, int],
+                 remote_addr: tuple[str, int]):
+        """Constructor.
+
+        Args:
+            client_addr: Client address.
+            remote_addr: Address to relay datagrams to.
+        """
+        self.client_addr = client_addr
+        self.remote_addr = remote_addr
+
+    def connection_made(self, transport: asyncio.DatagramTransport):
+        """Setup datagram transport."""
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]):
+        """Relay data to the other host."""
+        if addr == self.client_addr:
+            # If datagram is coming from the client.
+            try:
+                header = parse_udp_header(data)
+            except IncorrectUDPHeader:
+                # Ignore incorrect datagram.
+                return
+
+            if header.frag != 0:
+                # According to RFC 1918, servers that do NOT support
+                # fragmentation must drop all datagrams whose FRAG
+                # field is not 0.
+                return
+
+            # Offset the header
+            data = data[len(header):]
+            self.transport.sendto(data, self.remote_addr)
+        elif addr == self.remote_addr:
+            # If the datagram is coming from the remote host.
+            header = UDPHeader(
+                frag=0,
+                atyp=1, # TODO: Set correct atyp for IPv6.
+                dst_addr=self.client_addr[0],
+                dst_port=self.client_addr[1])
+
+            # Encapsulate datagram with the UDP header.
+            self.transport.sendto(header.dump() + data, self.client_addr)
+
+        # Ignore packets coming from unknown hosts.
+
+
 class SocksProtocol(asyncio.Protocol):
     """Proxy protocol class.
 
@@ -246,17 +389,24 @@ class SocksProtocol(asyncio.Protocol):
         connection negotiation, as well as request processing.
     """
 
-    remote: asyncio.Transport
+    remote: asyncio.Transport | None
+    relay: asyncio.DatagramTransport | None
 
-    def __init__(self, auth_method: AuthMethod = AuthMethod.NO_AUTH):
+    def __init__(self, 
+                 auth_method: AuthMethod,
+                 host: str):
         """Constructor.
 
         Args:
-            auth_method: SOCKS5 authentication method. No auth by
-                default.
+            auth_method: SOCKS5 authentication method.
+            host: Host the server is listening on.
+            
         """
         self.auth_method = auth_method
         self.logger = logging.getLogger()
+        self.remote = None
+        self.relay = None
+        self.host = host
         # TODO: Write a proper state machine.
         self.state = 0
 
@@ -268,6 +418,10 @@ class SocksProtocol(asyncio.Protocol):
 
     def connection_lost(self, error: Exception | None):
         """Client disconnect handler."""
+        if self.relay is not None:
+            # Close UDP relay when the TCP connection is lost.
+            self.relay.close()
+
         self._log_disconnected()
 
         if error is not None:
@@ -284,6 +438,10 @@ class SocksProtocol(asyncio.Protocol):
             return self.on_request(data)
 
         if self.state == 2:
+            if self.relay is not None:
+                # Ignore packets when the client is using an udp relay.
+                return
+
             assert self.remote is not None
             self.remote.write(data)
 
@@ -346,21 +504,50 @@ class SocksProtocol(asyncio.Protocol):
             ValueError: if host could not be resolved.
         """
         addr = await resolve_addr(host)
-        if addr is None:
-            raise ValueError("Unknown destination")
 
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_connection(
             lambda: ConnectionProtocol(client=self.transport),
-            host,
+            addr,
             port)
         return transport
 
     def on_bind(self, _: SocksRequest):
         raise NotImplementedError
 
-    def on_upd_associate(self, _: SocksRequest):
-        raise NotImplementedError
+    def on_upd_associate(self, request: SocksRequest):
+        task = asyncio.ensure_future(self._open_relay(
+            request.dst_addr,
+            request.dst_port))
+
+        @task.add_done_callback
+        def _(task: asyncio.Task):
+            try:
+                self.relay = task.result()
+            except Exception as exc:
+                self.logger.exception(
+                    f"DEBUG: {task.get_name()} raised {exc}",
+                    exc_info=exc)
+                send_error(self.transport, Error.FAILURE)
+                self.transport.close()
+            else:
+                # TODO: Remove duplicate code.
+                # (Same as in CONNECT handler)
+                sock = self.relay.get_extra_info("socket")
+                host, port, *_ = sock.getsockname()
+                reply = SocksReply(
+                    atyp=1 if sock.family == socket.AF_INET else 4,
+                    bnd_addr=host,
+                    bnd_port=port)
+                self.transport.write(reply.dump())
+                self.state = 2
+
+    async def _open_relay(self, dst_addr: str, dst_port: int):
+        """Open UDP relay."""
+        dst_addr = await resolve_addr(dst_addr)
+        return await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: UDPRelayProtocol(self.peer, (dst_addr, dst_port)),
+            local_addr=(self.host, 0))
 
     def handle_auth(self, message: bytes):
         """Handle authentication negotiation.
@@ -423,7 +610,7 @@ async def main():
 
     loop = asyncio.get_running_loop()
     server = await loop.create_server(
-        SocksProtocol,
+        lambda: SocksProtocol(AuthMethod.NO_AUTH, "0.0.0.0"),
         "0.0.0.0",
         args.port or PORT)
 
