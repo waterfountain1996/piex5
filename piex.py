@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import asyncio
 import enum
 from ipaddress import ip_address
@@ -9,6 +10,7 @@ import socket
 
 
 VERSION = 5
+PORT = 1080
 
 
 class AddressType(enum.Enum):
@@ -56,10 +58,7 @@ async def resolve_addr(host: str) -> str | None:
         IP address string if found, otherwise None.
     """
     loop = asyncio.get_running_loop()
-    try:
-        info = await loop.getaddrinfo(host, None, proto=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return None
+    info = await loop.getaddrinfo(host, None, proto=socket.SOCK_STREAM)
 
     return info[0][-1][0]
 
@@ -312,16 +311,26 @@ class SocksProtocol(asyncio.Protocol):
 
         @task.add_done_callback
         def _(task: asyncio.Task):
-            # TODO: Handle possible exception on task result.
-            self.remote = task.result()
-            sock = self.remote.get_extra_info("socket")
-            host, port, *_ = sock.getsockname()
-            reply = SocksReply(
-                atyp=1 if sock.family == socket.AF_INET else 4,
-                bnd_addr=host,
-                bnd_port=port)
-            self.transport.write(reply.dump())
-            self.state = 2
+            try:
+                self.remote = task.result()
+            except socket.gaierror:
+                send_error(self.transport, Error.HOST_UNREACHABLE)
+                self.transport.close()
+            except Exception as exc:
+                self.logger.exception(
+                    f"DEBUG: {task.get_name()} raised {exc}",
+                    exc_info=exc)
+                send_error(self.transport, Error.FAILURE)
+                self.transport.close()
+            else:
+                sock = self.remote.get_extra_info("socket")
+                host, port, *_ = sock.getsockname()
+                reply = SocksReply(
+                    atyp=1 if sock.family == socket.AF_INET else 4,
+                    bnd_addr=host,
+                    bnd_port=port)
+                self.transport.write(reply.dump())
+                self.state = 2
 
     async def _connect_to(self, host: str, port: int):
         """Connect to remote host.
@@ -395,6 +404,10 @@ class SocksProtocol(asyncio.Protocol):
     def _log_disconnected(self):
         """Log client disconnect message."""
         self.logger.info(f"{self.peer[0]}:{self.peer[1]} disconnected")
+
+
+parser = argparse.ArgumentParser(description="SOCKS5 proxy server")
+parser.add_argument("-p", dest="port", type=int, help="Port to listen on.")
  
         
 async def main():
@@ -403,10 +416,15 @@ async def main():
         format="%(asctime)s -- %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S")
 
-    loop = asyncio.get_running_loop()
-    server = await loop.create_server(SocksProtocol, "0.0.0.0", 1080)
+    args = parser.parse_args()
 
-    logging.info("Starting the server...")
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(
+        SocksProtocol,
+        "0.0.0.0",
+        args.port or PORT)
+
+    logging.info(f"Listening on {args.port or PORT}...")
     async with server:
         await server.serve_forever()
 
@@ -417,4 +435,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        logging.getLogger().info("Stopping the server")
+        logging.info("Stopping the server")
