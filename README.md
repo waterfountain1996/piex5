@@ -5,3 +5,7 @@ Asynchronous [SOCKS5](https://datatracker.ietf.org/doc/html/rfc1928) proxy serve
 ## TODO:
 - Implement BIND and UDP ASSOCIATE commands
 - Add support for username/password authentication
+
+## License
+
+This software is licensed under AGPL v3.0
