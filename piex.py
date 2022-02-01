@@ -291,7 +291,7 @@ def _unpack_address_from_buffer(atyp: AddressType,
         # Therefore we can just multiply `atyp` by 4 to get the length
         # of the address, and the last two bytes are the port number.
         try:
-            host = str(ip_address(buffer[4 * atyp.value]))
+            host = str(ip_address(buffer[:4 * atyp.value]))
             port = struct.unpack_from("!H", buffer, 4 * atyp.value)[0]
         except (ValueError, struct.error):
             raise IncorrectPacket()
