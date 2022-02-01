@@ -3,7 +3,8 @@
 import argparse
 import asyncio
 import enum
-from ipaddress import ip_address
+from functools import partial
+from ipaddress import IPv4Address, ip_address
 import logging
 import struct
 import socket
@@ -76,7 +77,7 @@ def send_error(transport: asyncio.WriteTransport, error: Error):
     # As this is an error reply and we will be closing the connection
     # after it anyway, we just use all zeros for address and port.
     buffer = struct.pack("!4BIH", VERSION, error.value, 0, 1, 0, 0)
-    transport.write(buffer)
+    write_to(transport, buffer)
 
 
 def send_auth_message(transport: asyncio.WriteTransport, method: AuthMethod):
@@ -87,7 +88,48 @@ def send_auth_message(transport: asyncio.WriteTransport, method: AuthMethod):
         method: Chosen authentication method.
     """
     buffer = struct.pack("!2B", VERSION, method.value)
-    transport.write(buffer)
+    write_to(transport, buffer)
+
+
+def write_to(transport: asyncio.WriteTransport | asyncio.DatagramTransport,
+             buffer: bytes,
+             address: tuple[str, int] = None):
+    """Write data to transport.
+
+    Args:
+        transport: Either a TCP or an UDP transport.
+        buffer: Data to write.
+        address: Optional address. Used to write data to UDP transport.
+    """
+    if isinstance(transport, asyncio.DatagramTransport):
+        if address is None:
+            raise ValueError(
+                "Address must not be None "
+                "to write to UDP transport")
+
+        _write = partial(transport.sendto, addr=address)
+    else:
+        _write = transport.write
+
+    _write(data=buffer)
+
+
+def _get_atyp_from_ip_address(addr: str) -> AddressType:
+    """Get address type of an IP address.
+
+    Returns:
+        AddressType enum.
+
+    Raises:
+        ValueError if `addr` is not a valid IP address.
+    """
+    ip = ip_address(addr)
+
+    if isinstance(ip, IPv4Address):
+        return AddressType.IP4
+
+    return AddressType.IP6
+
 
 
 class BaseSocksMessage:
@@ -123,7 +165,6 @@ class SocksReply(BaseSocksMessage):
         """Constructor.
         
         Args:
-            reply: Reply status code.
             atyp: SOCKS address type.
             bnd_addr: Server bound address.
             bnd_port: Server bound port.
@@ -323,7 +364,7 @@ class ConnectionProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes):
         """Write data back to the client."""
-        self.client.write(data)
+        write_to(self.client, data)
 
 
 class UDPRelayProtocol(asyncio.DatagramProtocol):
@@ -366,20 +407,50 @@ class UDPRelayProtocol(asyncio.DatagramProtocol):
                 return
 
             # Offset the header
-            data = data[len(header):]
-            self.transport.sendto(data, self.remote_addr)
+            write_to(self.transport, data[len(header):], self.remote_addr)
         elif addr == self.remote_addr:
             # If the datagram is coming from the remote host.
             header = UDPHeader(
                 frag=0,
-                atyp=1, # TODO: Set correct atyp for IPv6.
+                atyp=_get_atyp_from_ip_address(self.client_addr[0]).value,
                 dst_addr=self.client_addr[0],
                 dst_port=self.client_addr[1])
 
             # Encapsulate datagram with the UDP header.
-            self.transport.sendto(header.dump() + data, self.client_addr)
+            write_to(self.transport, header.dump() + data, self.client_addr)
 
-        # Ignore packets coming from unknown hosts.
+
+class BoundRelayProtocol(ConnectionProtocol):
+    
+    def __init__(self, relay_to: asyncio.WriteTransport, accept_from: str):
+        """Constructor.
+
+        Args:
+            relay_to: Writeable transport to send data to the client.
+            accept_from: DST_ADDR specified in BIND request.
+        """
+        self.accept_from = accept_from
+        self.relay_to = relay_to
+
+    def connection_made(self, transport: asyncio.Transport):
+        self.transport = transport
+        host, *_ = self.transport.get_extra_info("peername")
+
+        if host != self.accept_from:
+            # TODO: Close connection.
+            send_error(self.relay_to, Error.FAILURE)
+            return
+
+        bnd_addr, bnd_port, *_ = self.transport.get_extra_info("sockname")
+        reply = SocksReply(
+            atyp=_get_atyp_from_ip_address(bnd_addr).value,
+            bnd_addr=bnd_addr,
+            bnd_port=bnd_port)
+
+        write_to(self.relay_to, reply.dump())
+    
+    def data_received(self, data: bytes):
+        write_to(self.relay_to, data)
 
 
 class SocksProtocol(asyncio.Protocol):
@@ -389,23 +460,19 @@ class SocksProtocol(asyncio.Protocol):
         connection negotiation, as well as request processing.
     """
 
-    remote: asyncio.Transport | None
-    relay: asyncio.DatagramTransport | None
+    relay: asyncio.WriteTransport | asyncio.DatagramTransport | None
 
-    def __init__(self, 
-                 auth_method: AuthMethod,
-                 host: str):
+    def __init__(self, auth_method: AuthMethod, host: str):
         """Constructor.
 
         Args:
             auth_method: SOCKS5 authentication method.
             host: Host the server is listening on.
-            
         """
         self.auth_method = auth_method
         self.logger = logging.getLogger()
-        self.remote = None
         self.relay = None
+        self.ignore = False
         self.host = host
         # TODO: Write a proper state machine.
         self.state = 0
@@ -438,19 +505,15 @@ class SocksProtocol(asyncio.Protocol):
             return self.on_request(data)
 
         if self.state == 2:
-            if self.relay is not None:
-                # Ignore packets when the client is using an udp relay.
-                return
-
-            assert self.remote is not None
-            self.remote.write(data)
+            assert self.relay is not None
+            if not self.ignore:
+                write_to(self.relay, data)
 
     def on_request(self, buffer: bytes):
         """SOCKS5 request handler.
 
-        If the packet is correct, a corresponding handler is called
-            based on the request command, otherwise, an error reply
-            is sent to the client and the connection is closed.
+        If the packet is not correct, an error reply is sent to 
+            the client and the connection is closed.
 
         Args:
             buffer: Raw data from the client.
@@ -459,39 +522,39 @@ class SocksProtocol(asyncio.Protocol):
             request = parse_request(buffer)
         except IncorrectPacket:
             send_error(self.transport, Error.FAILURE)
-            return self.transport.close()
+            return self.close()
 
         self._log_request(request)
-        self.__getattribute__(f"on_{request.cmd.name.lower()}")(request)
 
-    def on_connect(self, request: SocksRequest):
-        """CONNECT request handler."""
-        task = asyncio.ensure_future(self._connect_to(
+        if request.cmd == Command.CONNECT:
+            awaitable = self._connect_to
+        elif request.cmd == Command.BIND:
+            awaitable = self._open_bound_relay
+        else:
+            # Ignore packets from client on this socket because
+            # they will be using UDP relay.
+            self.ignore = True
+            awaitable = self._open_udp_relay
+
+        task = asyncio.ensure_future(awaitable(
             request.dst_addr,
             request.dst_port))
 
-        @task.add_done_callback
-        def _(task: asyncio.Task):
-            try:
-                self.remote = task.result()
-            except socket.gaierror:
-                send_error(self.transport, Error.HOST_UNREACHABLE)
-                self.transport.close()
-            except Exception as exc:
-                self.logger.exception(
-                    f"DEBUG: {task.get_name()} raised {exc}",
-                    exc_info=exc)
-                send_error(self.transport, Error.FAILURE)
-                self.transport.close()
-            else:
-                sock = self.remote.get_extra_info("socket")
-                host, port, *_ = sock.getsockname()
-                reply = SocksReply(
-                    atyp=1 if sock.family == socket.AF_INET else 4,
-                    bnd_addr=host,
-                    bnd_port=port)
-                self.transport.write(reply.dump())
-                self.state = 2
+        task.add_done_callback(self._relay_established_callback)
+
+    async def _open_bound_relay(self, dst_addr: str, dst_port: int):
+        dst_addr = await resolve_addr(dst_addr)
+        return await asyncio.get_running_loop().create_server(
+            lambda: BoundRelayProtocol(self.transport, dst_addr),
+            dst_addr,
+            dst_port)
+
+    async def _open_udp_relay(self, dst_addr: str, dst_port: int):
+        """Open UDP relay."""
+        dst_addr = await resolve_addr(dst_addr)
+        return await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: UDPRelayProtocol(self.peer, (dst_addr, dst_port)),
+            local_addr=(self.host, 0))
 
     async def _connect_to(self, host: str, port: int):
         """Connect to remote host.
@@ -504,50 +567,30 @@ class SocksProtocol(asyncio.Protocol):
             ValueError: if host could not be resolved.
         """
         addr = await resolve_addr(host)
-
-        loop = asyncio.get_running_loop()
-        transport, _ = await loop.create_connection(
+        transport, _ = await asyncio.get_running_loop().create_connection(
             lambda: ConnectionProtocol(client=self.transport),
             addr,
             port)
         return transport
 
-    def on_bind(self, _: SocksRequest):
-        raise NotImplementedError
+    def _relay_established_callback(self, task: asyncio.Task):
+        try:
+            self.relay = task.result()
+        except Exception as exc:
+            self.logger.error(f"{task.get_name()} failed", exc_info=exc)
+            send_error(self.transport, Error.FAILURE)
+            return self.close()
 
-    def on_upd_associate(self, request: SocksRequest):
-        task = asyncio.ensure_future(self._open_relay(
-            request.dst_addr,
-            request.dst_port))
+        sock = self.relay.get_extra_info("socket")
+        host, port, *_ = sock.getsockname()
 
-        @task.add_done_callback
-        def _(task: asyncio.Task):
-            try:
-                self.relay = task.result()
-            except Exception as exc:
-                self.logger.exception(
-                    f"DEBUG: {task.get_name()} raised {exc}",
-                    exc_info=exc)
-                send_error(self.transport, Error.FAILURE)
-                self.transport.close()
-            else:
-                # TODO: Remove duplicate code.
-                # (Same as in CONNECT handler)
-                sock = self.relay.get_extra_info("socket")
-                host, port, *_ = sock.getsockname()
-                reply = SocksReply(
-                    atyp=1 if sock.family == socket.AF_INET else 4,
-                    bnd_addr=host,
-                    bnd_port=port)
-                self.transport.write(reply.dump())
-                self.state = 2
+        reply = SocksReply(
+            atyp=_get_atyp_from_ip_address(host).value,
+            bnd_addr=host,
+            bnd_port=port)
 
-    async def _open_relay(self, dst_addr: str, dst_port: int):
-        """Open UDP relay."""
-        dst_addr = await resolve_addr(dst_addr)
-        return await asyncio.get_running_loop().create_datagram_endpoint(
-            lambda: UDPRelayProtocol(self.peer, (dst_addr, dst_port)),
-            local_addr=(self.host, 0))
+        write_to(self.transport, reply.dump())
+        self.state = 2
 
     def handle_auth(self, message: bytes):
         """Handle authentication negotiation.
@@ -559,15 +602,19 @@ class SocksProtocol(asyncio.Protocol):
         try:
             methods = get_methods_from_message(message)
         except IncorrectPacket:
-            return self.transport.close()
+            return self.close()
 
         if self.auth_method not in methods:
             send_auth_message(self.transport, AuthMethod.INVALID)
-            return self.transport.close()
+            return self.close()
 
         send_auth_message(self.transport, self.auth_method)
         self._log_authed()
         self.state = 1
+
+    def close(self):
+        """Close the TCP connection."""
+        self.transport.close()
 
     def _log_data(self, data):
         """Log received data. Debug only."""
@@ -596,6 +643,40 @@ class SocksProtocol(asyncio.Protocol):
         self.logger.info(f"{self.peer[0]}:{self.peer[1]} disconnected")
 
 
+class SocksServer:
+    """SOCKS5 proxy server."""
+
+    def __init__(self, host: str, port: int, auth_method: AuthMethod):
+        """Constructor.
+
+        Args:
+            host: IP address to listen on.
+            port: Port to listen on.
+            auth_method: SOCKS5 authentication method.
+        """
+        self.host = host
+        self.port = port
+        self.auth_method = auth_method
+
+        self._loop = asyncio.get_running_loop()
+        self._logger = logging.getLogger()
+
+    async def run(self):
+        """Start the server.
+
+        Calls `serve_forever` internally.
+        """
+        self._server = await self._loop.create_server(
+            lambda: SocksProtocol(self.auth_method, self.host),
+            host=self.host,
+            port=self.port)
+
+        self._logger.info(f"Listening on {self.host}:{self.port}")
+
+        async with self._server:
+            await self._server.serve_forever()
+
+
 parser = argparse.ArgumentParser(description="SOCKS5 proxy server")
 parser.add_argument("-p", dest="port", type=int, help="Port to listen on.")
  
@@ -608,15 +689,8 @@ async def main():
 
     args = parser.parse_args()
 
-    loop = asyncio.get_running_loop()
-    server = await loop.create_server(
-        lambda: SocksProtocol(AuthMethod.NO_AUTH, "0.0.0.0"),
-        "0.0.0.0",
-        args.port or PORT)
-
-    logging.info(f"Listening on {args.port or PORT}...")
-    async with server:
-        await server.serve_forever()
+    server = SocksServer("0.0.0.0", args.port or PORT, AuthMethod.NO_AUTH)
+    await server.run()
 
 
 if __name__ == "__main__":
@@ -624,5 +698,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    finally:
-        logging.info("Stopping the server")
